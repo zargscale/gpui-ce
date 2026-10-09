@@ -192,6 +192,28 @@ pub struct WgpuContext {
     renderer_tier: RendererTier,
     device_lost: Arc<AtomicBool>,
     uncaptured_error: Arc<Mutex<Option<String>>>,
+    device_events: Arc<DeviceEvents>,
+}
+
+type DeviceLostListener = Box<dyn Fn(wgpu::DeviceLostReason, &str) + Send + Sync>;
+type ErrorListener = Box<dyn Fn(&wgpu::Error) + Send + Sync>;
+
+/// Device events GPUI hears and passes on to the application's listeners. wgpu keeps one
+/// device-lost callback and one uncaptured-error handler per device, so an application that hosts
+/// another renderer on GPUI's device listens here rather than installing its own (which would
+/// silence GPUI's recovery).
+#[derive(Default)]
+struct DeviceEvents {
+    lost: Mutex<Vec<DeviceLostListener>>,
+    errors: Mutex<Vec<ErrorListener>>,
+}
+
+/// GPUI's state a device's callbacks feed.
+#[derive(Clone)]
+struct DeviceCallbacks {
+    device_lost: Arc<AtomicBool>,
+    uncaptured_error: Arc<Mutex<Option<String>>>,
+    events: Arc<DeviceEvents>,
 }
 
 /// The resource transport selected for a device.
@@ -263,6 +285,16 @@ pub struct WgpuContextHandle {
     features: wgpu::Features,
     limits: wgpu::Limits,
     device_lost: Arc<AtomicBool>,
+    shared: Option<SharedContext>,
+}
+
+/// What a handle made from the window's context carries beyond the device: the instance and adapter
+/// the device came from, and the device's callbacks.
+#[derive(Clone)]
+struct SharedContext {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    callbacks: DeviceCallbacks,
 }
 
 impl WgpuContextHandle {
@@ -285,6 +317,56 @@ impl WgpuContextHandle {
             features,
             limits,
             device_lost,
+            shared: None,
+        }
+    }
+
+    /// The instance the device was created from (`None` for a handle made without the window's
+    /// context). Another renderer hosted on this device (e.g. a game engine) may need it.
+    pub fn instance(&self) -> Option<&wgpu::Instance> {
+        self.shared.as_ref().map(|s| &s.instance)
+    }
+
+    /// The adapter the device was created from (`None` for a handle made without the window's
+    /// context).
+    pub fn adapter(&self) -> Option<&wgpu::Adapter> {
+        self.shared.as_ref().map(|s| &s.adapter)
+    }
+
+    /// Calls `listener` when the device is lost (after GPUI has noted it).
+    pub fn on_device_lost(
+        &self,
+        listener: impl Fn(wgpu::DeviceLostReason, &str) + Send + Sync + 'static,
+    ) {
+        if let Some(s) = &self.shared {
+            s.callbacks
+                .events
+                .lost
+                .lock()
+                .unwrap()
+                .push(Box::new(listener));
+        }
+    }
+
+    /// Calls `listener` for each uncaptured error on the device (after GPUI has noted it).
+    pub fn on_uncaptured_error(&self, listener: impl Fn(&wgpu::Error) + Send + Sync + 'static) {
+        if let Some(s) = &self.shared {
+            s.callbacks
+                .events
+                .errors
+                .lock()
+                .unwrap()
+                .push(Box::new(listener));
+        }
+    }
+
+    /// Installs GPUI's device callbacks again. A device holds one of each, so a library that
+    /// installs its own on GPUI's device (a hosted renderer usually does when it starts) silences
+    /// GPUI's error reporting and device-loss recovery; call this after it has, and use
+    /// [`Self::on_device_lost`] and [`Self::on_uncaptured_error`] to hear the events.
+    pub fn reinstall_device_callbacks(&self) {
+        if let Some(s) = &self.shared {
+            install_device_callbacks(&self.device, &s.callbacks);
         }
     }
 
@@ -472,14 +554,24 @@ pub struct WgpuDeviceRequirements {
 
 impl WgpuContext {
     pub(crate) fn handle(&self, texture_format: wgpu::TextureFormat) -> WgpuContextHandle {
-        WgpuContextHandle::from_resources(
+        let mut handle = WgpuContextHandle::from_resources(
             Arc::clone(&self.device),
             Arc::clone(&self.queue),
             texture_format,
             self.adapter.get_info(),
             self.backend,
             Arc::clone(&self.device_lost),
-        )
+        );
+        handle.shared = Some(SharedContext {
+            instance: self.instance.clone(),
+            adapter: self.adapter.clone(),
+            callbacks: DeviceCallbacks {
+                device_lost: Arc::clone(&self.device_lost),
+                uncaptured_error: Arc::clone(&self.uncaptured_error),
+                events: Arc::clone(&self.device_events),
+            },
+        });
+        handle
     }
 
     /// Creates a native device without a presentation surface.
@@ -607,7 +699,17 @@ impl WgpuContext {
         adapter: wgpu::Adapter,
         device: CreatedDevice,
     ) -> anyhow::Result<Self> {
-        let (device_lost, uncaptured_error) = install_device_callbacks(&device.device);
+        let callbacks = DeviceCallbacks {
+            device_lost: Arc::new(AtomicBool::new(false)),
+            uncaptured_error: Arc::new(Mutex::new(None)),
+            events: Arc::new(DeviceEvents::default()),
+        };
+        install_device_callbacks(&device.device, &callbacks);
+        let DeviceCallbacks {
+            device_lost,
+            uncaptured_error,
+            events: device_events,
+        } = callbacks;
         let info = adapter.get_info();
         log::info!("Selected GPU adapter: {:?} ({:?})", info.name, info.backend);
         #[cfg(target_family = "wasm")]
@@ -632,6 +734,7 @@ impl WgpuContext {
             renderer_tier: device.renderer_tier,
             device_lost,
             uncaptured_error,
+            device_events,
         })
     }
 
@@ -982,29 +1085,30 @@ fn renderer_tier(adapter: &wgpu::Adapter) -> RendererTier {
     }
 }
 
-fn install_device_callbacks(
-    device: &wgpu::Device,
-) -> (Arc<AtomicBool>, Arc<Mutex<Option<String>>>) {
-    let device_lost = Arc::new(AtomicBool::new(false));
+fn install_device_callbacks(device: &wgpu::Device, callbacks: &DeviceCallbacks) {
     device.set_device_lost_callback({
-        let device_lost = Arc::clone(&device_lost);
+        let callbacks = callbacks.clone();
         move |reason, message| {
             log::error!("wgpu device lost: reason={reason:?}, message={message}");
             if reason != wgpu::DeviceLostReason::Destroyed {
-                device_lost.store(true, Ordering::Relaxed);
+                callbacks.device_lost.store(true, Ordering::Relaxed);
+            }
+            for listener in callbacks.events.lost.lock().unwrap().iter() {
+                listener(reason, &message);
             }
         }
     });
-    let uncaptured_error = Arc::new(Mutex::new(None));
     device.on_uncaptured_error(Arc::new({
-        let uncaptured_error = Arc::clone(&uncaptured_error);
+        let callbacks = callbacks.clone();
         move |error| {
             let message = error.to_string();
             log::error!("uncaptured wgpu error: {message}");
-            *uncaptured_error.lock().unwrap() = Some(message);
+            *callbacks.uncaptured_error.lock().unwrap() = Some(message);
+            for listener in callbacks.events.errors.lock().unwrap().iter() {
+                listener(&error);
+            }
         }
     }));
-    (device_lost, uncaptured_error)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1099,6 +1203,92 @@ mod tests {
         assert_eq!(
             parse_pci_id(&format!("{:#x}", 0x1234)).unwrap(),
             parse_pci_id(&format!("{:#X}", 0x1234)).unwrap(),
+        );
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod shared_device_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn context() -> Option<WgpuContext> {
+        match WgpuContext::new_headless(None) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("no GPU ({e}): skipped");
+                None
+            }
+        }
+    }
+
+    /// A validation error: a buffer that can't be both mapped for reading and a storage buffer.
+    fn provoke_error(device: &wgpu::Device) {
+        let _ = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("invalid"),
+            size: 16,
+            mapped_at_creation: false,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE,
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    #[test]
+    fn the_handle_shares_the_instance_and_adapter() {
+        let Some(c) = context() else { return };
+        let h = c.handle(wgpu::TextureFormat::Rgba8Unorm);
+        let a = h.adapter().expect("the adapter");
+        assert_eq!(a.get_info().device, c.adapter.get_info().device);
+        assert!(h.instance().is_some());
+    }
+
+    #[test]
+    fn apps_hear_errors_and_gpui_takes_its_callbacks_back() {
+        let Some(c) = context() else { return };
+        let h = c.handle(wgpu::TextureFormat::Rgba8Unorm);
+        let heard = Arc::new(AtomicUsize::new(0));
+        let n = Arc::clone(&heard);
+        h.on_uncaptured_error(move |_| {
+            n.fetch_add(1, Ordering::Relaxed);
+        });
+        provoke_error(h.device());
+        assert_eq!(heard.load(Ordering::Relaxed), 1, "the app's subscriber");
+        assert!(
+            c.uncaptured_error.lock().unwrap().take().is_some(),
+            "and gpui's own slot"
+        );
+
+        // another library on the same device replaces the callback: gpui hears nothing
+        h.device().on_uncaptured_error(Arc::new(|_| {}));
+        provoke_error(h.device());
+        assert!(c.uncaptured_error.lock().unwrap().is_none());
+        // until gpui takes it back
+        h.reinstall_device_callbacks();
+        provoke_error(h.device());
+        assert!(c.uncaptured_error.lock().unwrap().is_some());
+        assert_eq!(heard.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn apps_hear_a_lost_device() {
+        let Some(c) = context() else { return };
+        let h = c.handle(wgpu::TextureFormat::Rgba8Unorm);
+        let lost = Arc::new(Mutex::new(None));
+        let l = Arc::clone(&lost);
+        h.on_device_lost(move |reason, _| {
+            *l.lock().unwrap() = Some(reason);
+        });
+        h.device().set_device_lost_callback(|_, _| {}); // overwritten by another library…
+        h.reinstall_device_callbacks(); // …and taken back
+        h.device().destroy();
+        let _ = h.device().poll(wgpu::PollType::wait_indefinitely());
+        assert_eq!(
+            *lost.lock().unwrap(),
+            Some(wgpu::DeviceLostReason::Destroyed)
+        );
+        assert!(
+            !h.device_lost(),
+            "a deliberate destroy isn't a loss gpui recovers from"
         );
     }
 }
