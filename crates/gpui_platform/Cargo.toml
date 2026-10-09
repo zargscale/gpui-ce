@@ -13,6 +13,9 @@ workspace = true
 path = "src/gpui_platform.rs"
 
 [features]
+# kept for crates built against gpui_ce_platform 0.1.0 (it built macOS Metal shaders at runtime; the wgpu renderer
+# has none to build): asking for it does nothing
+runtime_shaders = []
 default = []
 bench-support = [
   "gpui/bench-support",
