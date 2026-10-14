@@ -550,6 +550,61 @@ pub struct WgpuDeviceRequirements {
     /// `max(gpui_limit, app_limit)` for upper-bound limits and
     /// `min(gpui_limit, app_limit)` for alignment/lower-bound limits.
     pub limits: Option<wgpu::Limits>,
+    /// Optional requirements derived from the adapter currently being tried. The
+    /// policy is retained across fallback and recovery; resolved values are not.
+    /// Use [`Self::for_adapter`] to construct one. Static struct literals should
+    /// include `..Default::default()` when they do not need a policy.
+    pub adapter_requirements: Option<WgpuAdapterRequirements>,
+}
+
+/// A shareable capability policy evaluated before requesting each native device.
+/// Callbacks must be fast and must not create a device or start another selection.
+/// Only the returned features and limits are used (callbacks are not recursive).
+#[derive(Clone)]
+pub struct WgpuAdapterRequirements(
+    Arc<dyn Fn(wgpu::Features, &wgpu::Limits) -> WgpuDeviceRequirements + Send + Sync>,
+);
+
+impl std::fmt::Debug for WgpuAdapterRequirements {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WgpuAdapterRequirements(..)")
+    }
+}
+
+impl WgpuDeviceRequirements {
+    /// Compute extra requirements from each actual candidate's capabilities,
+    /// rather than probing a possibly different adapter before opening a window.
+    /// Fixed requirements on this value are merged with the callback result.
+    pub fn for_adapter(
+        callback: impl Fn(wgpu::Features, &wgpu::Limits) -> Self + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            adapter_requirements: Some(WgpuAdapterRequirements(Arc::new(callback))),
+            ..Default::default()
+        }
+    }
+
+    /// Resolve a policy for supplied adapter capabilities. GPUI calls this at
+    /// device creation; applications may also use it to test capability policies.
+    /// Explicit requirements are never silently clamped to what the GPU supports.
+    pub fn resolve_for_adapter(&self, features: wgpu::Features, limits: &wgpu::Limits) -> Self {
+        let mut resolved = Self {
+            features: self.features,
+            limits: self.limits.clone(),
+            ..Default::default()
+        };
+        if let Some(policy) = &self.adapter_requirements {
+            let extra = (policy.0)(features, limits);
+            resolved.features |= extra.features;
+            if let Some(extra_limits) = extra.limits {
+                resolved.limits = Some(match resolved.limits {
+                    Some(fixed) => fixed.or_better_values_from(&extra_limits),
+                    None => extra_limits,
+                });
+            }
+        }
+        resolved
+    }
 }
 
 impl WgpuContext {
@@ -770,8 +825,11 @@ impl WgpuContext {
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
 
-        // Merge application-requested requirements.
-        if let Some(reqs) = extra_requirements {
+        // Resolve against THIS candidate immediately before request_device. This
+        // path is shared by initial selection, fallback, headless and recovery.
+        if let Some(reqs) = extra_requirements
+            .map(|reqs| reqs.resolve_for_adapter(adapter.features(), &adapter.limits()))
+        {
             required_features |= reqs.features;
             if let Some(limits) = &reqs.limits {
                 required_limits = required_limits.or_better_values_from(limits);
@@ -1206,6 +1264,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "adapter_requirements_tests.rs"]
+mod adapter_requirements_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod shared_device_tests {
