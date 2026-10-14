@@ -467,30 +467,40 @@ mod tests {
                 height: ScaledPixels(3.0),
             },
         };
-        let mut scene = Scene::default();
-        // Forces a non-zero first-instance index in the mixed-type arena.
-        scene.insert_primitive(Quad::default());
-        scene.insert_primitive(Underline {
-            order: 0,
-            padding: 0,
-            bounds,
-            content_mask: gpui::ContentMask {
+        for (alpha, expected_red) in [(0.0, 0u8), (0.25, 64), (0.5, 128), (0.75, 191), (1.0, 255)] {
+            let mut scene = Scene::default();
+            // Forces a non-zero first-instance index in the mixed-type arena.
+            scene.insert_primitive(Quad::default());
+            scene.insert_primitive(Underline {
+                order: 0,
+                padding: 0,
                 bounds,
-                ..Default::default()
-            },
-            color: gpui::hsla(0.0, 1.0, 0.5, 0.5).into(),
-            thickness: ScaledPixels(1.0),
-            wavy: false.into(),
-        });
-        scene.finish();
+                content_mask: gpui::ContentMask {
+                    bounds,
+                    ..Default::default()
+                },
+                color: gpui::hsla(0.0, 1.0, 0.5, alpha).into(),
+                thickness: ScaledPixels(1.0),
+                wavy: false.into(),
+            });
+            scene.finish();
 
-        let image = renderer.render_to_image(&scene)?;
-        let center = image.get_pixel(1, 1).0;
-        assert_eq!(
-            center,
-            [128, 0, 0, 255],
-            "must match the retired Metal renderer's mixed primitive baseline"
-        );
+            let image = renderer.render_to_image(&scene)?;
+            let center = image.get_pixel(1, 1).0;
+            // Red over opaque black is alpha * 255. At alpha=0.5 that is
+            // 127.5: native blending/UNORM8 quantization need not match Metal's
+            // 128 byte exactly (Vulkan can produce 127). One code value is enough;
+            // applying opacity twice instead gives about 64, well outside this bound.
+            assert!(
+                center[0].abs_diff(expected_red) <= 1,
+                "opacity must be applied once: alpha={alpha}, got {center:?}, expected red {expected_red} ±1"
+            );
+            assert_eq!(
+                &center[1..],
+                &[0, 0, 255],
+                "green/blue/alpha at opacity {alpha}"
+            );
+        }
         Ok(())
     }
 
